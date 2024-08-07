@@ -17,89 +17,54 @@ limitations under the License.
 package main
 
 import (
-	"fmt"
-	"os"
-	"regexp"
-	"strings"
+    "context"
+    "flag"
+    "fmt"
+    "log"
+    "path/filepath"
 
-	flag "github.com/spf13/pflag"
-	kruntime "k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/klog/v2"
+    "k8s.io/client-go/kubernetes"
+    "k8s.io/client-go/tools/clientcmd"
+    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
-
-var (
-	typeSrc = flag.StringP("type-src", "s", "", "From where we are going to read the types")
-	re      = regexp.MustCompile("`(\\b\\w+\\b)`")
-)
-
-// kubeTypesMap is a map from field name to its tag name and doc.
-type kubeTypesMap map[string]kruntime.Pair
 
 func main() {
-	flag.Parse()
+    var kubeconfig *string
+    if home := homeDir(); home != "" {
+        kubeconfig = flag.String("kubeconfig", filepath.Join(home, ".kube", "config"), "(optional) absolute path to the kubeconfig file")
+    } else {
+        kubeconfig = flag.String("kubeconfig", "", "absolute path to the kubeconfig file")
+    }
+    namespace := flag.String("namespace", "default", "The namespace to list pods from")
+    flag.Parse()
 
-	if *typeSrc == "" {
-		klog.Fatalf("Please define -s flag as it is the api type file")
-	}
+    // Build the configuration from the kubeconfig file
+    config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
+    if err != nil {
+        log.Fatalf("Error building kubeconfig: %v", err)
+    }
 
-	docsForTypes := kruntime.ParseDocumentationFrom(*typeSrc)
-	rc := false
+    // Create the clientset
+    clientset, err := kubernetes.NewForConfig(config)
+    if err != nil {
+        log.Fatalf("Error creating Kubernetes client: %v", err)
+    }
 
-	for _, ks := range docsForTypes {
-		typesMap := make(kubeTypesMap)
+    // List pods in the specified namespace
+    pods, err := clientset.CoreV1().Pods(*namespace).List(context.TODO(), metav1.ListOptions{})
+    if err != nil {
+        log.Fatalf("Error listing pods: %v", err)
+    }
 
-		for _, p := range ks[1:] {
-			// skip the field with no tag name
-			if p.Name != "" {
-				typesMap[strings.ToLower(p.Name)] = p
-			}
-		}
-
-		structName := ks[0].Name
-
-		rc = checkFieldNameAndDoc(structName, "", ks[0].Doc, typesMap) || rc
-		for _, p := range ks[1:] {
-			rc = checkFieldNameAndDoc(structName, p.Name, p.Doc, typesMap) || rc
-		}
-	}
-
-	if rc {
-		os.Exit(1)
-	}
+    fmt.Printf("There are %d pods in the namespace %s\n", len(pods.Items), *namespace)
+    for _, pod := range pods.Items {
+        fmt.Printf("Pod name: %s\n", pod.Name)
+    }
 }
 
-func checkFieldNameAndDoc(structName, fieldName, doc string, typesMap kubeTypesMap) bool {
-	rc := false
-	visited := sets.Set[string]{}
-
-	// The rule is:
-	// 1. Get all back-tick quoted names in the doc
-	// 2. Skip the name which is already found mismatched.
-	// 3. Skip the name whose lowercase is different from the lowercase of tag names,
-	//    because some docs use back-tick to quote field value or nil
-	// 4. Check if the name is different from its tag name
-
-	// TODO: a manual pass adding back-ticks to the doc strings, then update the linter to
-	// check the existence of back-ticks
-	nameGroups := re.FindAllStringSubmatch(doc, -1)
-	for _, nameGroup := range nameGroups {
-		name := nameGroup[1]
-		if visited.Has(name) {
-			continue
-		}
-		if p, ok := typesMap[strings.ToLower(name)]; ok && p.Name != name {
-			rc = true
-			visited.Insert(name)
-
-			fmt.Fprintf(os.Stderr, "Error: doc for %s", structName)
-			if fieldName != "" {
-				fmt.Fprintf(os.Stderr, ".%s", fieldName)
-			}
-
-			fmt.Fprintf(os.Stderr, " contains: %s, which should be: %s\n", name, p.Name)
-		}
-	}
-
-	return rc
+func homeDir() string {
+    if h := os.Getenv("HOME"); h != "" {
+        return h
+    }
+    return os.Getenv("USERPROFILE") // windows
 }
